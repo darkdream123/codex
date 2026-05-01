@@ -25,12 +25,13 @@ use codex_sandboxing::policy_transforms::normalize_additional_permissions;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
 use serde::Deserialize;
-use serde_json::Value;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::function_tool::FunctionCallError;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 pub(crate) use crate::tools::code_mode::CodeModeExecuteHandler;
 pub(crate) use crate::tools::code_mode::CodeModeWaitHandler;
 pub use apply_patch::ApplyPatchHandler;
@@ -74,16 +75,79 @@ where
     parse_arguments(arguments)
 }
 
-fn resolve_workdir_base_path(
+pub(crate) struct ProcessToolEnvironment {
+    pub(crate) environment: Arc<codex_exec_server::Environment>,
+    pub(crate) cwd: AbsolutePathBuf,
+}
+
+impl ProcessToolEnvironment {
+    pub(crate) fn resolve_workdir(&self, workdir: Option<&str>) -> AbsolutePathBuf {
+        workdir
+            .filter(|workdir| !workdir.is_empty())
+            .map_or_else(|| self.cwd.clone(), |workdir| self.cwd.join(workdir))
+    }
+}
+
+pub(crate) struct ProcessToolCall<T> {
+    pub(crate) params: T,
+    pub(crate) target_environment: ProcessToolEnvironment,
+    pub(crate) cwd: AbsolutePathBuf,
+}
+
+#[derive(Deserialize)]
+struct ProcessToolRoutingArgs {
+    environment_id: Option<String>,
+    workdir: Option<String>,
+}
+
+pub(crate) fn resolve_process_tool_environment(
+    turn: &TurnContext,
+    environment_id: Option<&str>,
+) -> Result<Option<ProcessToolEnvironment>, FunctionCallError> {
+    // The model only needs to provide an id once there are multiple choices.
+    if environment_id.is_none() && turn.environments.len() <= 1 {
+        return Ok(turn
+            .environments
+            .primary()
+            .map(|environment| ProcessToolEnvironment {
+                environment: Arc::clone(&environment.environment),
+                cwd: environment.cwd.clone(),
+            }));
+    }
+
+    let selected_environment = turn
+        .environments
+        .selected_environment(environment_id)
+        .map_err(FunctionCallError::RespondToModel)?;
+    if let Some(environment) = selected_environment {
+        return Ok(Some(ProcessToolEnvironment {
+            environment: Arc::clone(&environment.environment),
+            cwd: environment.cwd.clone(),
+        }));
+    }
+    Ok(None)
+}
+
+pub(crate) fn resolve_process_tool_call_from_arguments<T>(
+    turn: &TurnContext,
     arguments: &str,
-    default_cwd: &AbsolutePathBuf,
-) -> Result<AbsolutePathBuf, FunctionCallError> {
-    let arguments: Value = parse_arguments(arguments)?;
-    Ok(arguments
-        .get("workdir")
-        .and_then(Value::as_str)
-        .filter(|workdir| !workdir.is_empty())
-        .map_or_else(|| default_cwd.clone(), |workdir| default_cwd.join(workdir)))
+    unavailable_message: &'static str,
+) -> Result<ProcessToolCall<T>, FunctionCallError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let routing_args: ProcessToolRoutingArgs = parse_arguments(arguments)?;
+    let target_environment =
+        resolve_process_tool_environment(turn, routing_args.environment_id.as_deref())?
+            .ok_or_else(|| FunctionCallError::RespondToModel(unavailable_message.to_string()))?;
+    let cwd = target_environment.resolve_workdir(routing_args.workdir.as_deref());
+    let params = parse_arguments_with_base_path(arguments, &cwd)?;
+
+    Ok(ProcessToolCall {
+        params,
+        target_environment,
+        cwd,
+    })
 }
 
 /// Validates feature/policy constraints for `with_additional_permissions` and
@@ -228,13 +292,17 @@ fn permissions_are_preapproved(
 #[cfg(test)]
 mod tests {
     use super::EffectiveAdditionalPermissions;
+    use super::ProcessToolRoutingArgs;
     use super::implicit_granted_permissions;
     use super::normalize_and_validate_additional_permissions;
+    use super::parse_arguments;
+    use super::parse_arguments_with_base_path;
     use super::permissions_are_preapproved;
     use crate::sandboxing::SandboxPermissions;
     use codex_protocol::models::AdditionalPermissionProfile;
     use codex_protocol::models::FileSystemPermissions;
     use codex_protocol::models::NetworkPermissions;
+    use codex_protocol::models::ShellCommandToolCallParams;
     use codex_protocol::permissions::FileSystemAccessMode;
     use codex_protocol::permissions::FileSystemPath;
     use codex_protocol::permissions::FileSystemSandboxEntry;
@@ -266,6 +334,62 @@ mod tests {
             )),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn process_tool_routing_does_not_require_typed_argument_parsing() {
+        let arguments = serde_json::json!({
+            "command": "touch relative-write.txt",
+            "workdir": "nested",
+            "environment_id": "remote",
+            "sandbox_permissions": SandboxPermissions::WithAdditionalPermissions,
+            "additional_permissions": {
+                "file_system": {
+                    "write": ["."]
+                }
+            }
+        })
+        .to_string();
+
+        let routing_args: ProcessToolRoutingArgs =
+            parse_arguments(&arguments).expect("routing args should parse");
+
+        assert_eq!(routing_args.environment_id, Some("remote".to_string()));
+        assert_eq!(routing_args.workdir, Some("nested".to_string()));
+    }
+
+    #[test]
+    fn shell_command_args_resolve_relative_additional_permissions_against_workdir_base() {
+        let workspace = tempdir().expect("tempdir");
+        let nested = workspace.path().join("nested");
+        std::fs::create_dir_all(&nested).expect("create nested directory");
+        let base = AbsolutePathBuf::from_absolute_path(&nested).expect("absolute nested path");
+
+        let arguments = serde_json::json!({
+            "command": "touch relative-write.txt",
+            "workdir": "nested",
+            "sandbox_permissions": SandboxPermissions::WithAdditionalPermissions,
+            "additional_permissions": {
+                "file_system": {
+                    "write": ["."]
+                }
+            }
+        })
+        .to_string();
+
+        let params: ShellCommandToolCallParams =
+            parse_arguments_with_base_path(&arguments, &base).expect("shell args should parse");
+
+        assert_eq!(
+            params.additional_permissions,
+            Some(AdditionalPermissionProfile {
+                file_system: Some(FileSystemPermissions::from_read_write_roots(
+                    /*read*/ None,
+                    Some(vec![base]),
+                )),
+                ..Default::default()
+            })
+        );
     }
 
     #[test]

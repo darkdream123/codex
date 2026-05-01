@@ -50,6 +50,23 @@ impl ResolvedTurnEnvironments {
         self.primary()
             .map(|environment| environment.environment.get_filesystem())
     }
+
+    pub(crate) fn selected_environment(
+        &self,
+        environment_id: Option<&str>,
+    ) -> Result<Option<&TurnEnvironment>, String> {
+        let Some(environment_id) = environment_id else {
+            return Ok(self.primary());
+        };
+        if environment_id.is_empty() {
+            return Err("environment_id cannot be empty".to_string());
+        }
+        self.turn_environments
+            .iter()
+            .find(|environment| environment.environment_id == environment_id)
+            .map(Some)
+            .ok_or_else(|| format!("unknown selected environment_id `{environment_id}`"))
+    }
 }
 
 pub(crate) fn resolve_environment_selections(

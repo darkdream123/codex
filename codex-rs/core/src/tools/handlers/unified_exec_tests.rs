@@ -1,7 +1,6 @@
 use super::*;
 use crate::shell::default_user_shell;
 use crate::tools::handlers::parse_arguments_with_base_path;
-use crate::tools::handlers::resolve_workdir_base_path;
 use codex_protocol::models::AdditionalPermissionProfile as PermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
 use codex_tools::UnifiedExecShellMode;
@@ -202,7 +201,7 @@ fn exec_command_args_resolve_relative_additional_permissions_against_workdir() -
             }
         }"#;
 
-    let base_path = resolve_workdir_base_path(json, &cwd.path().abs())?;
+    let base_path = cwd.path().abs().join("nested");
     let args: ExecCommandArgs = parse_arguments_with_base_path(json, &base_path)?;
 
     assert_eq!(
