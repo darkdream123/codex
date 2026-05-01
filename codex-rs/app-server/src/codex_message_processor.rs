@@ -109,6 +109,7 @@ use codex_app_server_protocol::MockExperimentalMethodParams;
 use codex_app_server_protocol::MockExperimentalMethodResponse;
 use codex_app_server_protocol::ModelListParams;
 use codex_app_server_protocol::ModelListResponse;
+use codex_app_server_protocol::PatchApplyStatus;
 use codex_app_server_protocol::PermissionProfileModificationParams;
 use codex_app_server_protocol::PermissionProfileSelectionParams;
 use codex_app_server_protocol::PluginDetail;
@@ -174,6 +175,7 @@ use codex_app_server_protocol::ThreadGoalSetParams;
 use codex_app_server_protocol::ThreadGoalSetResponse;
 use codex_app_server_protocol::ThreadGoalStatus;
 use codex_app_server_protocol::ThreadGoalUpdatedNotification;
+use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::ThreadIncrementElicitationParams;
 use codex_app_server_protocol::ThreadIncrementElicitationResponse;
 use codex_app_server_protocol::ThreadInjectItemsParams;
@@ -373,6 +375,8 @@ use codex_protocol::protocol::W3cTraceContext;
 use codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS;
 use codex_protocol::user_input::UserInput as CoreInputItem;
 use codex_rmcp_client::perform_oauth_login_return_url;
+use codex_rollout::EventPersistenceMode;
+use codex_rollout::is_persisted_rollout_item;
 use codex_rollout::state_db::StateDbHandle;
 use codex_rollout::state_db::get_state_db;
 use codex_rollout::state_db::reconcile_rollout;
@@ -4039,7 +4043,7 @@ impl CodexMessageProcessor {
                 let (mut thread, history) =
                     thread_from_stored_thread(stored_thread, fallback_provider, &self.config.cwd);
                 if include_turns && let Some(history) = history {
-                    thread.turns = build_turns_from_rollout_items(&history.items);
+                    thread.turns = build_limited_turns_from_rollout_items(&history.items);
                 }
                 Ok(Some(thread))
             }
@@ -4104,7 +4108,7 @@ impl CodexMessageProcessor {
                 .load_history(/*include_archived*/ true)
                 .await
                 .map_err(|err| thread_read_history_load_error(thread_id, err))?;
-            thread.turns = build_turns_from_rollout_items(&history.items);
+            thread.turns = build_limited_turns_from_rollout_items(&history.items);
         }
 
         Ok(())
@@ -4926,7 +4930,7 @@ impl CodexMessageProcessor {
         thread.path = Some(rollout_path.to_path_buf());
         if include_turns {
             let history_items = thread_history.get_rollout_items();
-            populate_thread_turns_from_history(
+            populate_thread_turns_from_limited_history(
                 &mut thread,
                 &history_items,
                 /*active_turn*/ None,
@@ -8416,7 +8420,7 @@ async fn handle_pending_thread_resume_request(
     let connection_id = request_id.connection_id;
     let mut thread = pending.thread_summary;
     if pending.include_turns
-        && let Err(message) = populate_thread_turns_from_history(
+        && let Err(message) = populate_thread_turns_from_limited_history(
             &mut thread,
             &pending.history_items,
             active_turn.as_ref(),
@@ -8591,6 +8595,55 @@ fn populate_thread_turns_from_history(
     }
     thread.turns = turns;
     Ok(())
+}
+
+fn populate_thread_turns_from_limited_history(
+    thread: &mut Thread,
+    items: &[RolloutItem],
+    active_turn: Option<&Turn>,
+) -> std::result::Result<(), String> {
+    let mut turns = build_limited_turns_from_rollout_items(items);
+    if let Some(active_turn) = active_turn {
+        merge_turn_history_with_active_turn(&mut turns, limited_active_turn(active_turn.clone()));
+    }
+    thread.turns = turns;
+    Ok(())
+}
+
+fn build_limited_turns_from_rollout_items(items: &[RolloutItem]) -> Vec<Turn> {
+    let mut builder = ThreadHistoryBuilder::new();
+    for item in items {
+        if is_persisted_rollout_item(item, EventPersistenceMode::Limited) {
+            builder.handle_rollout_item(item);
+        }
+    }
+    builder.finish()
+}
+
+fn limited_active_turn(mut turn: Turn) -> Turn {
+    turn.items.retain(thread_item_maps_to_limited_rollout);
+    turn
+}
+
+fn thread_item_maps_to_limited_rollout(item: &ThreadItem) -> bool {
+    match item {
+        ThreadItem::UserMessage { .. }
+        | ThreadItem::HookPrompt { .. }
+        | ThreadItem::AgentMessage { .. }
+        | ThreadItem::Plan { .. }
+        | ThreadItem::Reasoning { .. }
+        | ThreadItem::ContextCompaction { .. }
+        | ThreadItem::EnteredReviewMode { .. }
+        | ThreadItem::ExitedReviewMode { .. } => true,
+        ThreadItem::FileChange { status, .. } => !matches!(status, PatchApplyStatus::InProgress),
+        ThreadItem::ImageGeneration { status, .. } => !status.is_empty(),
+        ThreadItem::CommandExecution { .. }
+        | ThreadItem::McpToolCall { .. }
+        | ThreadItem::DynamicToolCall { .. }
+        | ThreadItem::CollabAgentToolCall { .. }
+        | ThreadItem::WebSearch { .. }
+        | ThreadItem::ImageView { .. } => false,
+    }
 }
 
 async fn resolve_pending_server_request(
@@ -10206,6 +10259,105 @@ mod tests {
         );
 
         assert_eq!(turns.last(), Some(&active_turn));
+    }
+
+    #[test]
+    fn limited_turn_projection_filters_extended_rollout_items() {
+        let items = vec![
+            RolloutItem::EventMsg(EventMsg::TurnStarted(
+                codex_protocol::protocol::TurnStartedEvent {
+                    turn_id: "turn-1".to_string(),
+                    started_at: None,
+                    model_context_window: None,
+                    collaboration_mode_kind: Default::default(),
+                },
+            )),
+            RolloutItem::EventMsg(EventMsg::UserMessage(
+                codex_protocol::protocol::UserMessageEvent {
+                    message: "generate then search".to_string(),
+                    images: None,
+                    local_images: Vec::new(),
+                    text_elements: Vec::new(),
+                },
+            )),
+            RolloutItem::EventMsg(EventMsg::WebSearchEnd(
+                codex_protocol::protocol::WebSearchEndEvent {
+                    call_id: "web-1".to_string(),
+                    query: "oversized".to_string(),
+                    action: codex_protocol::models::WebSearchAction::Search {
+                        query: Some("oversized".to_string()),
+                        queries: None,
+                    },
+                },
+            )),
+            RolloutItem::EventMsg(EventMsg::ImageGenerationEnd(
+                codex_protocol::protocol::ImageGenerationEndEvent {
+                    call_id: "image-1".to_string(),
+                    status: "completed".to_string(),
+                    revised_prompt: None,
+                    result: "image-bytes".to_string(),
+                    saved_path: None,
+                },
+            )),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(
+                codex_protocol::protocol::TurnCompleteEvent {
+                    turn_id: "turn-1".to_string(),
+                    last_agent_message: None,
+                    completed_at: None,
+                    duration_ms: None,
+                    time_to_first_token_ms: None,
+                },
+            )),
+        ];
+
+        let turns = build_limited_turns_from_rollout_items(&items);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].items.len(), 2);
+        assert!(matches!(turns[0].items[0], ThreadItem::UserMessage { .. }));
+        assert!(matches!(
+            turns[0].items[1],
+            ThreadItem::ImageGeneration { .. }
+        ));
+    }
+
+    #[test]
+    fn limited_active_turn_filters_extended_live_items() {
+        let active_turn = Turn {
+            id: "turn-1".to_string(),
+            items: vec![
+                ThreadItem::WebSearch {
+                    id: "web-1".to_string(),
+                    query: "oversized".to_string(),
+                    action: None,
+                },
+                ThreadItem::UserMessage {
+                    id: "user-1".to_string(),
+                    content: vec![V2UserInput::Text {
+                        text: "hello".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                },
+            ],
+            error: None,
+            status: TurnStatus::InProgress,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+        };
+
+        let filtered_turn = limited_active_turn(active_turn);
+
+        assert_eq!(
+            filtered_turn.items,
+            vec![ThreadItem::UserMessage {
+                id: "user-1".to_string(),
+                content: vec![V2UserInput::Text {
+                    text: "hello".to_string(),
+                    text_elements: Vec::new(),
+                }],
+            }]
+        );
     }
 
     #[test]

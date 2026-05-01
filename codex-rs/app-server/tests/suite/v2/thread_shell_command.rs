@@ -137,22 +137,13 @@ async fn thread_shell_command_runs_as_standalone_turn_and_persists_history() -> 
     .await??;
     let ThreadReadResponse { thread, .. } = to_response::<ThreadReadResponse>(read_resp)?;
     assert_eq!(thread.turns.len(), 1);
-    let ThreadItem::CommandExecution {
-        source,
-        status,
-        aggregated_output,
-        ..
-    } = thread.turns[0]
-        .items
-        .iter()
-        .find(|item| matches!(item, ThreadItem::CommandExecution { .. }))
-        .expect("expected persisted command execution item")
-    else {
-        unreachable!("matched command execution item");
-    };
-    assert_eq!(source, &CommandExecutionSource::UserShell);
-    assert_eq!(status, &CommandExecutionStatus::Completed);
-    assert_eq!(aggregated_output.as_deref(), Some(expected_output.as_str()));
+    assert!(
+        thread.turns[0]
+            .items
+            .iter()
+            .all(|item| !matches!(item, ThreadItem::CommandExecution { .. })),
+        "thread/read should project persisted Extended command executions out of returned turns"
+    );
 
     Ok(())
 }
@@ -308,17 +299,11 @@ async fn thread_shell_command_uses_existing_active_turn() -> Result<()> {
     let ThreadReadResponse { thread, .. } = to_response::<ThreadReadResponse>(read_resp)?;
     assert_eq!(thread.turns.len(), 1);
     assert!(
-        thread.turns[0].items.iter().any(|item| {
-            matches!(
-                item,
-                ThreadItem::CommandExecution {
-                    source: CommandExecutionSource::UserShell,
-                    aggregated_output,
-                    ..
-                } if aggregated_output.as_deref() == Some(expected_output.as_str())
-            )
-        }),
-        "expected active-turn shell command to be persisted on the existing turn"
+        thread.turns[0]
+            .items
+            .iter()
+            .all(|item| !matches!(item, ThreadItem::CommandExecution { .. })),
+        "thread/read should project persisted Extended command executions out of returned turns"
     );
 
     Ok(())
